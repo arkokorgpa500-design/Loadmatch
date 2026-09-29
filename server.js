@@ -1,0 +1,28 @@
+import express from 'express';
+import session from 'express-session';
+import Database from 'better-sqlite3';
+import crypto from 'crypto';
+
+const app=express();
+const db=new Database(process.env.DB_FILE||'loadmatch.db');
+db.pragma('journal_mode=WAL');
+db.exec(`CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,password TEXT NOT NULL,role TEXT NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);CREATE TABLE IF NOT EXISTS loads(id INTEGER PRIMARY KEY AUTOINCREMENT,owner_id INTEGER NOT NULL,from_city TEXT NOT NULL,to_city TEXT NOT NULL,date TEXT NOT NULL,type TEXT NOT NULL,price REAL NOT NULL,phone TEXT,description TEXT,status TEXT DEFAULT 'open',accepted_driver_id INTEGER,created_at TEXT DEFAULT CURRENT_TIMESTAMP);CREATE TABLE IF NOT EXISTS applications(id INTEGER PRIMARY KEY AUTOINCREMENT,load_id INTEGER NOT NULL,driver_id INTEGER NOT NULL,status TEXT DEFAULT 'pending',created_at TEXT DEFAULT CURRENT_TIMESTAMP,UNIQUE(load_id,driver_id));`);
+app.set('trust proxy', 1);
+app.use(express.json());
+app.get('/health',(req,res)=>res.json({ok:true,service:'loadmatch'}));
+app.use(session({secret:process.env.SESSION_SECRET||'CHANGE_ME_IN_PRODUCTION',resave:false,saveUninitialized:false,cookie:{httpOnly:true,sameSite:'lax',secure:process.env.NODE_ENV==='production',maxAge:7*24*3600*1000}}));
+app.use(express.static('public'));
+const hash=p=>crypto.createHash('sha256').update(p).digest('hex');
+const auth=(req,res,next)=>req.session.user?next():res.status(401).json({error:'Необходимо е влизане.'});
+app.post('/api/register',(req,res)=>{try{const {name,email,password,role}=req.body;if(!name||!email||!password||!['Клиент','Шофьор'].includes(role))return res.status(400).json({error:'Попълнете всички полета.'});const info=db.prepare('INSERT INTO users(name,email,password,role) VALUES(?,?,?,?)').run(name,email.toLowerCase(),hash(password),role);req.session.user={id:info.lastInsertRowid,name,email:email.toLowerCase(),role};res.json({user:req.session.user})}catch(e){res.status(400).json({error:'Този имейл вече съществува.'})}});
+app.post('/api/login',(req,res)=>{const {email,password}=req.body;const u=db.prepare('SELECT id,name,email,role,password FROM users WHERE email=?').get((email||'').toLowerCase());if(!u||u.password!==hash(password||''))return res.status(401).json({error:'Грешен имейл или парола.'});delete u.password;req.session.user=u;res.json({user:u})});
+app.post('/api/logout',(req,res)=>req.session.destroy(()=>res.json({ok:true})));
+app.get('/api/me',(req,res)=>res.json({user:req.session.user||null}));
+app.get('/api/loads',(req,res)=>{const {q='',type=''}=req.query;const rows=db.prepare(`SELECT l.*,u.name owner_name FROM loads l JOIN users u ON u.id=l.owner_id WHERE (l.from_city LIKE ? OR l.to_city LIKE ? OR l.type LIKE ? OR l.description LIKE ?) AND (?='' OR l.type=?) ORDER BY l.id DESC`).all(`%${q}%`,`%${q}%`,`%${q}%`,`%${q}%`,type,type);res.json(rows)});
+app.post('/api/loads',auth,(req,res)=>{if(req.session.user.role!=='Клиент')return res.status(403).json({error:'Само клиент може да публикува товар.'});const {from,to,date,type,price,phone,description}=req.body;if(!from||!to||!date||!type||!Number(price))return res.status(400).json({error:'Липсват данни.'});const r=db.prepare('INSERT INTO loads(owner_id,from_city,to_city,date,type,price,phone,description) VALUES(?,?,?,?,?,?,?,?)').run(req.session.user.id,from,to,date,type,Number(price),phone||'',description||'');res.json({id:r.lastInsertRowid})});
+app.post('/api/loads/:id/apply',auth,(req,res)=>{if(req.session.user.role!=='Шофьор')return res.status(403).json({error:'Само шофьор може да кандидатства.'});try{db.prepare('INSERT INTO applications(load_id,driver_id) VALUES(?,?)').run(req.params.id,req.session.user.id);res.json({ok:true})}catch(e){res.status(400).json({error:'Вече сте кандидатствали.'})}});
+app.get('/api/my/loads',auth,(req,res)=>res.json(db.prepare('SELECT * FROM loads WHERE owner_id=? ORDER BY id DESC').all(req.session.user.id)));
+app.get('/api/loads/:id/applications',auth,(req,res)=>{const l=db.prepare('SELECT * FROM loads WHERE id=?').get(req.params.id);if(!l||l.owner_id!==req.session.user.id)return res.status(403).json({error:'Нямате достъп.'});res.json(db.prepare('SELECT a.*,u.name,u.email FROM applications a JOIN users u ON u.id=a.driver_id WHERE a.load_id=?').all(req.params.id))});
+app.post('/api/loads/:id/accept/:driverId',auth,(req,res)=>{const l=db.prepare('SELECT * FROM loads WHERE id=?').get(req.params.id);if(!l||l.owner_id!==req.session.user.id)return res.status(403).json({error:'Нямате достъп.'});db.prepare('UPDATE loads SET status=\'assigned\',accepted_driver_id=? WHERE id=?').run(req.params.driverId,req.params.id);db.prepare('UPDATE applications SET status=CASE WHEN driver_id=? THEN \'accepted\' ELSE \'rejected\' END WHERE load_id=?').run(req.params.driverId,req.params.id);res.json({ok:true,commission:l.price*.10})});
+app.get('/api/stats',auth,(req,res)=>{const loads=db.prepare('SELECT COUNT(*) n FROM loads').get().n;const drivers=db.prepare("SELECT COUNT(*) n FROM users WHERE role='Шофьор'").get().n;const assigned=db.prepare("SELECT COUNT(*) n FROM loads WHERE status='assigned'").get().n;const fees=db.prepare("SELECT COALESCE(SUM(price*.10),0) n FROM loads WHERE status='assigned'").get().n;res.json({loads,drivers,assigned,fees})});
+const port=process.env.PORT||3000;app.listen(port,()=>console.log(`LoadMatch running on :${port}`));
